@@ -1,0 +1,14 @@
+[package]
+name = "got_auditor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Per parsejar l'executable i trobar la GOT
+goblin = "0.8"
+# Per mapejar la memòria del procés (/proc/PID/maps)
+procfs = "0.16"
+# Per llegir la RAM d'un altre procés de forma segura
+read-process-memory = "0.1"
+# Per gestionar errors de manera elegant
+anyhow = "1.0"
