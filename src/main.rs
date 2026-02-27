@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 
 // Mode Verbose: Pots canviar-ho a true o fer que sigui un argument
-const VERBOSE: bool = true;
+const VERBOSE: bool = false;
 
 struct LibCache {
     offsets: HashMap<String, u64>,
@@ -35,6 +35,13 @@ impl LibCache {
 
 fn main() -> Result<()> {
     let target_name = "sshd";
+
+    let ifunc_optimizations = [
+        "strlen", "memcpy", "memmove", "memset", "strcmp", "strncmp", 
+        "strchr", "strrchr", "strspn", "strcspn", "strpbrk", "strncasecmp", 
+        "strcasecmp", "memcmp", "__memcpy_chk", "__memset_chk", "__memmove_chk",
+        "strnlen", "memchr"
+    ];
     let all_procs = procfs::process::all_processes()?;
     let process = all_procs.into_iter().filter_map(Result::ok)
         .find(|p| p.stat().map(|s| s.comm == target_name).unwrap_or(false))
@@ -133,11 +140,18 @@ fn main() -> Result<()> {
                     Some(expected) if expected == offset_ram => {
                         if VERBOSE { println!("\x1b[0;32m[OK]\x1b[0m {} (0x{:x})", sym_name, pointer); }
                     },
-                    Some(expected) => {
-                        println!("\x1b[0;31m[ALERTA]\x1b[0m {} manipulat! Esperat 0x{:x}, Real 0x{:x}", sym_name, expected, offset_ram);
+                    Some(_) => {
+                        if ifunc_optimizations.contains(&sym_name) {
+                            if VERBOSE { println!("\x1b[0;36m[IFUNC]\x1b[0m {} optimitzat per CPU (0x{:x})", sym_name, pointer); }
+                        } else {
+                            println!("\x1b[0;31m[ALERTA REAL]\x1b[0m {} manipulat! Offset anòmal: 0x{:x}", sym_name, offset_ram);
+                        }
                     },
                     None => {
-                        println!("\x1b[0;31m[SEGREST]\x1b[0m {} redirigit a {}", sym_name, lib_path);
+                        // Aquest és el cas més perillós: el símbol apunta a una llibreria que no és la seva
+                        println!("\x1b[0;1;31m[!!! SEGREST DETECTAT !!!]\x1b[0m");
+                        println!("    El símbol '{}' hauria d'estar a la llibreria original,", sym_name);
+                        println!("    però apunta a: {}", lib_path);
                     }
                 }
             }
