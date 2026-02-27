@@ -4,6 +4,31 @@ use goblin::elf::Elf;
 use read_process_memory::{CopyAddress, ProcessHandle};
 use std::convert::TryFrom;
 use std::fs;
+use std::collections::HashMap;
+
+// Estructura per guardar els offsets d'una llibreria ja analitzada
+struct LibCache {
+    offsets: HashMap<String, u64>,
+}
+
+impl LibCache {
+    fn new(path: &str) -> Result<Self> {
+        let buffer = fs::read(path)?;
+        let elf = Elf::parse(&buffer)?;
+        let mut offsets = HashMap::new();
+
+        for sym in elf.dynsyms.iter() {
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                // st_value en un .so és l'offset relatiu des de la base
+                if sym.st_value != 0 {
+                    offsets.insert(name.to_string(), sym.st_value);
+                }
+            }
+        }
+        Ok(LibCache { offsets })
+    }
+}
+
 
 fn main() -> Result<()> {
     // 1. Busquem el procés víctima (ex: sshd)
@@ -45,6 +70,38 @@ fn main() -> Result<()> {
     let buffer = fs::read(path)?;
     let elf = Elf::parse(&buffer)?;
 
+    // 3b. Preparem un mapa per tenir el nom de cada símbol en una adreça de la GOT
+    let mut got_names: HashMap<u64, &str> = HashMap::new();
+
+    // mantenim una cache global de les biblioteques ja analitzades per evitar reiteracions
+    let mut global_cache: HashMap<String, LibCache> = HashMap::new();
+
+    // les relocalitzacions que afecten la PLT/GOT poden aparèixer en diverses llistes
+    for rel in &elf.pltrelocs {
+        if let Some(sym) = elf.dynsyms.get(rel.r_sym) {
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                let addr = base_address + rel.r_offset;
+                got_names.insert(addr, name);
+            }
+        }
+    }
+    for rel in &elf.dynrels {
+        if let Some(sym) = elf.dynsyms.get(rel.r_sym) {
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                let addr = base_address + rel.r_offset;
+                got_names.insert(addr, name);
+            }
+        }
+    }
+    for rela in &elf.dynrelas {
+        if let Some(sym) = elf.dynsyms.get(rela.r_sym) {
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                let addr = base_address + rela.r_offset;
+                got_names.insert(addr, name);
+            }
+        }
+    }
+
     // Busquem la secció .got.plt o la .got (per a binaris Full RELRO)
     let got_section = elf.section_headers.iter()
         .find(|s| {
@@ -78,18 +135,76 @@ fn main() -> Result<()> {
 
             // 5. Verifiquem a quina llibreria pertany aquest punter
             if let Some(map) = maps.iter().find(|m| pointer >= m.address.0 && pointer <= m.address.1) {
-                let lib_name = path_to_string(&map.pathname);
-                
-                // AQUÍ ESTÀ LA LOGICA DE DETECCIÓ:
-                // Si el punter apunta a liblzma però hauria d'anar a libcrypto...
-                println!("  [GOT Entry] 0x{:x} -> apunta a: {}", addr, lib_name);
-                
-                if lib_name.contains("liblzma") {
-                    println!("  \033[0;31m[ALERTA]\033[0m Punter sospitós detectat cap a xz/lzma!");
+                let lib_path = path_to_string(&map.pathname);
+                let sym_name = got_names.get(&addr).copied().unwrap_or("???");
+
+                if sym_name != "???" && lib_path.starts_with("/") {
+                    // 1. Obtenim la base de la llibreria a la RAM (inici del mapping)
+                    let lib_base_ram = map.address.0;
+                    let offset_real = pointer - lib_base_ram;
+
+                    // 2. Busquem l'offset teòric al fitxer del disc
+                    let cache = global_cache.entry(lib_path.clone()).or_insert_with(|| {
+                        LibCache::new(&lib_path).expect("Error analitzant llibreria")
+                    });
+
+                    if let Some(&offset_teoric) = cache.offsets.get(sym_name) {
+                        if offset_real != offset_teoric {
+                            println!(
+                                "\033[0;31m[ALERTA CRÍTICA]\033[0m Símbol '{}' manipulat!", 
+                                sym_name
+                            );
+                            println!("  Lloc: {}", lib_path);
+                            println!("  Offset Disc: 0x{:x}", offset_teoric);
+                            println!("  Offset RAM:  0x{:x}", offset_real);
+                            println!("  Diferència:  {} bytes", (offset_real as i64 - offset_teoric as i64));
+                        } else {
+                            // println!("[OK] {} verificat", sym_name);
+                        }
+                    }
                 }
             }
         }
     }
+
+    // 1. Obtenim les dependències teòriques (DT_NEEDED) del binari al disc
+let dependencies = &elf.libraries; 
+println!("[*] Dependències declarades al disc: {:?}", dependencies);
+
+// 2. Millorem el bucle de la GOT amb la "Prova de Coherència"
+for i in (0..got_size).step_by(8) {
+    let addr = got_address_in_ram + i;
+    let mut buf = [0u8; 8];
+    
+    if handle.copy_address(addr as usize, &mut buf).is_ok() {
+        let pointer = u64::from_le_bytes(buf);
+        if pointer == 0 { continue; }
+
+        if let Some(map) = maps.iter().find(|m| pointer >= m.address.0 && pointer <= m.address.1) {
+            let lib_en_ram = path_to_string(&map.pathname);
+            let sym_name = got_names.get(&addr).copied().unwrap_or("???");
+
+            // Lògica de verificació:
+            // Si el símbol és d'OpenSSL (per nom) però la llibreria no és libcrypto...
+            let is_crypto_sym = sym_name.starts_with("RSA_") || sym_name.starts_with("EVP_");
+            let points_to_crypto = lib_en_ram.contains("libcrypto");
+            let points_to_lzma = lib_en_ram.contains("liblzma");
+
+            if is_crypto_sym && !points_to_crypto {
+                println!("  \033[0;31m[ALERTA CRÍTICA]\033[0m");
+                println!("    Símbol: {}", sym_name);
+                println!("    Esperat en: libcrypto.so");
+                println!("    Trobat en:  {}", lib_en_ram);
+            } else if points_to_lzma {
+                // El cas específic de xz/liblzma
+                println!("  \033[0;31m[BACKDOOR DETECTAT]\033[0m {} apunta a liblzma!", sym_name);
+            } else {
+                // Tot correcte
+                // println!("  [OK] {} -> {}", sym_name, lib_en_ram);
+            }
+        }
+    }
+}
 
     Ok(())
 }
