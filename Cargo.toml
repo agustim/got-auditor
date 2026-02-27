@@ -12,3 +12,5 @@ procfs = "0.16"
 read-process-memory = "0.1"
 # Per gestionar errors de manera elegant
 anyhow = "1.0"
+# CLI parsing
+clap = { version = "4.3", features = ["derive"] }
