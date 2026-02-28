@@ -27,13 +27,23 @@ struct LibCache {
 }
 
 impl LibCache {
-    fn new(path: &str, first_symbol_offset: Option<i64>) -> Result<Self> {
-        let buffer = fs::read(path)?;
+    fn new(path_str: &str, pid: i32) -> Result<Self> {
+        // Intentem llegir el fitxer. Si falla, provem la ruta a través de /proc
+        let buffer = fs::read(path_str).or_else(|_| {
+            let proc_path = format!("/proc/{}/root{}", pid, path_str);
+            fs::read(&proc_path)
+        }).map_err(|e| {
+            // Això ens dirà exactament quin fitxer no troba
+            eprintln!("      \x1b[0;33m[!]\x1b[0m No es pot accedir a {} (Error: {})", path_str, e);
+            e
+        })?;
+
         let elf = Elf::parse(&buffer)?;
         let mut offsets = HashMap::new();
 
         for sym in elf.dynsyms.iter() {
             if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                // st_value és l'offset dins del fitxer .so
                 if sym.st_value != 0 {
                     offsets.insert(name.to_string(), sym.st_value);
                 }
@@ -42,7 +52,7 @@ impl LibCache {
 
         Ok(LibCache {
             offsets,
-            bias: first_symbol_offset.unwrap_or(0),
+            bias: 0, // El calcularem dinàmicament amb el primer match
         })
     }
 }
@@ -171,13 +181,13 @@ fn main() -> Result<()> {
 
 // --- LÒGICA D'AUTO-CALIBRATGE REFINADA (SENSE WARNINGS) ---
                 if !global_cache.contains_key(&lib_path) {
-                    let temp_cache = LibCache::new(&lib_path, None)?;
-                    
-                    // Inicialitzem el cache amb bias 0
-                    global_cache.insert(lib_path.clone(), temp_cache);
-                    
-                    if args.verbose {
-                        println!("[v] Nova llibreria detectada: {}", lib_path);
+                    if let Ok(c) = LibCache::new(&lib_path, pid) {
+                        global_cache.insert(lib_path.clone(), c);
+                        if args.verbose {
+                            println!("[v] Nova llibreria detectada: {}", lib_path);
+                        }
+                    } else {
+                    continue; // Si no podem llegir la llibreria, passem a la següent
                     }
                 }
 
