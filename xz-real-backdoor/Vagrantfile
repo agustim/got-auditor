@@ -1,0 +1,141 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "debian/bookworm64"
+
+  config.vm.synced_folder "..", "/got-auditor"
+  config.vm.network "forwarded_port", guest: 2222, host: 2223
+
+  config.vm.provision "shell", inline: <<~'SHELL'
+    set -e
+
+    SNAPSHOT="http://snapshot.debian.org/archive/debian/20240328T025657Z"
+
+    # ── PINNING ───────────────────────────────────────────────────────────────
+    # Sid: prioritat baixa per defecte, alta NOMÉS per als paquets vulnerables
+    cat > /etc/apt/preferences.d/pin-sid <<'EOF'
+Package: *
+Pin: release n=sid
+Pin-Priority: 100
+
+Package: liblzma5
+Pin: release n=sid
+Pin-Priority: 950
+
+Package: xz-utils
+Pin: release n=sid
+Pin-Priority: 950
+
+Package: openssh-server
+Pin: release n=sid
+Pin-Priority: 950
+
+Package: openssh-client
+Pin: release n=sid
+Pin-Priority: 950
+
+Package: openssh-sftp-server
+Pin: release n=sid
+Pin-Priority: 950
+EOF
+
+    # Bloquegem libssl i libc per evitar que sid els actualitzi
+    cat > /etc/apt/preferences.d/hold-base <<'EOF'
+Package: libc6
+Pin: release n=bookworm
+Pin-Priority: 1001
+
+Package: libc-bin
+Pin: release n=bookworm
+Pin-Priority: 1001
+
+Package: libssl3
+Pin: release n=bookworm
+Pin-Priority: 1001
+
+Package: libssl3t64
+Pin: version 3.0.*
+Pin-Priority: -1
+EOF
+
+    echo "deb [trusted=yes] ${SNAPSHOT} sid main" \
+      > /etc/apt/sources.list.d/snapshot-sid.list
+
+    apt-get update -o Acquire::Check-Valid-Until=false
+
+    # ── liblzma 5.6.1-1 (backdoored) ─────────────────────────────────────────
+    LZMA_VER=$(dpkg -l liblzma5 2>/dev/null | awk '/^ii/{print $3}')
+    if [ "$LZMA_VER" != "5.6.1-1" ]; then
+      apt-get install -y --no-install-recommends \
+        -o Acquire::Check-Valid-Until=false \
+        liblzma5=5.6.1-1 xz-utils=5.6.1-1
+    fi
+
+    # ── openssh 9.7p1 de sid (el target real del backdoor) ───────────────────
+    # Instal·lem amb --no-upgrade per a libssl (no deixem que sid la toqui)
+    SSH_VER=$(dpkg -l openssh-server 2>/dev/null | awk '/^ii/{print $3}')
+    if [ "$SSH_VER" != "1:9.7p1-2+b1" ]; then
+      apt-get install -y \
+        -o Acquire::Check-Valid-Until=false \
+        -o APT::Get::allow-downgrades=false \
+        openssh-server=1:9.7p1-2+b1 \
+        openssh-client=1:9.7p1-2+b1 \
+        openssh-sftp-server=1:9.7p1-2+b1 || {
+          echo "[!] No s'ha pogut instal·lar openssh 9.7p1 net."
+          echo "[!] Prova manualment: apt-get install -y openssh-server=1:9.7p1-2+b1"
+        }
+    fi
+
+    apt-get install -y --no-install-recommends gdb binutils vim-common
+
+    # ── Verificació ───────────────────────────────────────────────────────────
+    echo ""
+    echo "=== Versions instal·lades ==="
+    dpkg -l liblzma5 openssh-server libc6 libssl3 | grep '^ii' | awk '{print $2, $3}'
+
+    echo ""
+    echo "=== SHA256 liblzma (605861f... = backdoored) ==="
+    sha256sum /usr/lib/x86_64-linux-gnu/liblzma.so.5.6.1
+
+    echo ""
+    echo "=== Cadena sshd -> libsystemd -> liblzma ==="
+    ldd /usr/sbin/sshd | grep -E "systemd|lzma|ssl|crypto"
+
+    systemctl restart sshd
+    sleep 1
+
+    echo ""
+    echo "=== Comprova si el backdoor s'ha activat ==="
+    # El backdoor patcha RSA_public_decrypt en RAM durant l'init de liblzma.
+    # Si s'ha activat, els primers bytes de RSA_public_decrypt en memòria
+    # seran diferent als del fitxer libcrypto.so.3 del disc.
+    SSHD_PID=$(ps -eo pid,args | awk '/\/usr\/sbin\/sshd.*-D/{print $1}' | head -1)
+    echo "PID listener sshd: $SSHD_PID"
+
+    CRYPTO_PATH=$(grep -m1 libcrypto /proc/$SSHD_PID/maps | awk '{print $6}')
+    BASE=$(awk -F'[-p ]' '/libcrypto/{print "0x"$1; exit}' /proc/$SSHD_PID/maps)
+
+    # resolve symbol offset and handle failures (ignore version suffix)
+    RSA_OFF=$(readelf -Ws "$CRYPTO_PATH" | awk '/RSA_public_decrypt/ { if ($2) { print "0x"$2; exit } }')
+    if [ -z "$RSA_OFF" ]; then
+      echo "[!] unable to find RSA_public_decrypt in $CRYPTO_PATH"
+      echo "    available matches:";
+      readelf -Ws "$CRYPTO_PATH" | grep RSA_public_decrypt || true
+    else
+      RSA_RAM=$(python3 -c "print(hex($BASE + $RSA_OFF))")
+      echo "RSA_public_decrypt en RAM: $RSA_RAM"
+      echo "Primers 8 bytes (disc):"
+      dd if="$CRYPTO_PATH" bs=1 skip=$(python3 -c "print($RSA_OFF)") count=8 2>/dev/null | xxd
+      echo "Primers 8 bytes (RAM via /proc):"
+      dd if=/proc/$SSHD_PID/mem bs=1 skip=$(python3 -c "print($RSA_RAM, 0)") count=8 2>/dev/null | xxd || \
+        echo "(necessita got-auditor per llegir RAM)"
+    fi
+    echo "Primers 8 bytes (disc):"
+    dd if="$CRYPTO_PATH" bs=1 skip=$(python3 -c "print($RSA_OFF)") count=8 2>/dev/null | xxd
+    echo "Primers 8 bytes (RAM via /proc):"
+    dd if=/proc/$SSHD_PID/mem bs=1 skip=$(python3 -c "print($RSA_RAM, 0)") count=8 2>/dev/null | xxd || \
+      echo "(necessita got-auditor per llegir RAM)"
+
+    echo ""
+    echo "=== LLEST. Auditoria: ==="
+    echo "sudo /got-auditor/target/debug/got_auditor -t sshd --pid $SSHD_PID --check-code"
+  SHELL
+end

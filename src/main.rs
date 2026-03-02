@@ -19,6 +19,106 @@ struct Args {
     /// Ignora els símbols IFUNC optimitzats (recomanat)
     #[arg(short, long, default_value_t = true)]
     ignore_ifunc: bool,
+
+    /// Verifica els bytes de codi de les funcions PLT (no només el punter GOT)
+    #[arg(short = 'c', long, default_value_t = false)]
+    check_code: bool,
+
+    /// PID específic a analitzar (opcional, sobreescriu la cerca per nom)
+    #[arg(short = 'p', long)]
+    pid: Option<i32>,
+}
+
+/// Funcions crítiques que sempre es verifiquen a nivell de bytes,
+/// independentment del flag --check-code. Són els targets principals
+/// de CVE-2024-3094 i atacs similars de hooking de funcions criptogràfiques.
+const ALWAYS_CHECK_CODE: &[&str] = &[
+    "RSA_public_decrypt",
+    "RSA_private_encrypt",
+    "RSA_set0_key",
+    "RSA_set0_factors",
+    "RSA_set0_crt_params",
+    "EVP_PKEY_set1_RSA",
+    "EC_KEY_set_private_key",
+];
+
+/// Funcions que glibc patcheja legítimament en runtime (lock elision TSX/RTM,
+/// adaptive mutexes, HWCAP optimizations). Excloem la verificació de bytes
+/// per evitar falsos positius en sistemes amb suport TSX/RTM al CPU.
+const RUNTIME_PATCHED_LIBC: &[&str] = &[
+    "pthread_cond_init",
+    "pthread_cond_destroy",
+    "pthread_cond_signal",
+    "pthread_cond_broadcast",
+    "pthread_cond_wait",
+    "pthread_cond_timedwait",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "pthread_mutex_trylock",
+    "sched_getaffinity",
+];
+
+/// Llegeix `size` bytes de la funció `sym_name` des del fitxer ELF en disc,
+/// i els compara amb els bytes en RAM a `ram_addr`.
+/// Retorna:
+///   Ok(true)  → bytes idèntics (sense patch)
+///   Ok(false) → bytes difereixen (potencial hook/backdoor)
+///   Err(...)  → no s'ha pogut fer la comparació
+fn verify_function_bytes(
+    sym_name: &str,
+    ram_addr: u64,
+    lib_path: &str,
+    pid: i32,
+    handle: &ProcessHandle,
+    size: usize,
+) -> Result<bool> {
+    // Netegem el sufix " (deleted)" que afegeix el kernel quan la lib
+    // ha estat reemplaçada al disc però el procés encara la té mapada.
+    let clean_path = lib_path.trim_end_matches(" (deleted)");
+
+    // Llegim el fitxer ELF del disc
+    let buf = fs::read(clean_path)
+        .or_else(|_| fs::read(format!("/proc/{}/root{}", pid, clean_path)))
+        .with_context(|| format!("No s'ha pogut llegir {}", clean_path))?;
+
+    let elf = Elf::parse(&buf)
+        .with_context(|| format!("No s'ha pogut parsejar {}", lib_path))?;
+
+    // Busquem el símbol a la taula dinàmica
+    let sym_vaddr = elf.dynsyms.iter()
+        .find_map(|s| {
+            if elf.dynstrtab.get_at(s.st_name) == Some(sym_name) && s.st_value != 0 {
+                Some(s.st_value)
+            } else {
+                None
+            }
+        })
+        .with_context(|| format!("Símbol '{}' no trobat a {}", sym_name, lib_path))?;
+
+    // Traduïm l'adreça virtual a offset de fitxer via els segments PT_LOAD
+    let file_offset = elf.program_headers.iter().find_map(|ph| {
+        if ph.p_type == goblin::elf::program_header::PT_LOAD
+            && ph.p_vaddr <= sym_vaddr
+            && sym_vaddr < ph.p_vaddr + ph.p_filesz
+        {
+            Some((sym_vaddr - ph.p_vaddr + ph.p_offset) as usize)
+        } else {
+            None
+        }
+    }).with_context(|| format!("No s'ha trobat el segment per a '{}' a {}", sym_name, lib_path))?;
+
+    if file_offset + size > buf.len() {
+        anyhow::bail!("Offset fora de rang per a '{}'  a {}", sym_name, lib_path);
+    }
+
+    let disc_bytes = &buf[file_offset..file_offset + size];
+
+    // Llegim els mateixos bytes des de la RAM del procés
+    let mut ram_bytes = vec![0u8; size];
+    handle.copy_address(ram_addr as usize, &mut ram_bytes)
+        .with_context(|| format!("No s'ha pogut llegir RAM a 0x{:x}", ram_addr))?;
+
+    Ok(disc_bytes == ram_bytes.as_slice())
 }
 
 struct LibCache {
@@ -29,9 +129,13 @@ struct LibCache {
 
 impl LibCache {
     fn new(path_str: &str, pid: i32) -> Result<Self> {
+        // Netegem el sufix " (deleted)" que afegeix el kernel quan la lib
+        // ha estat reemplaçada al disc però el procés encara la té mapada.
+        let clean_path = path_str.trim_end_matches(" (deleted)");
+
         // Intentem llegir el fitxer. Si falla, provem la ruta a través de /proc
-        let buffer = fs::read(path_str).or_else(|_| {
-            let proc_path = format!("/proc/{}/root{}", pid, path_str);
+        let buffer = fs::read(clean_path).or_else(|_| {
+            let proc_path = format!("/proc/{}/root{}", pid, clean_path);
             fs::read(&proc_path)
         }).map_err(|e| {
             // Això ens dirà exactament quin fitxer no troba
@@ -82,12 +186,17 @@ fn main() -> Result<()> {
 
     let target_name = args.target;
 
-    let all_procs = procfs::process::all_processes()?;
-    let process = all_procs
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|p| p.stat().map(|s| s.comm == target_name).unwrap_or(false))
-        .context("No s'ha trobat el procés")?;
+    let process = if let Some(pid) = args.pid {
+        procfs::process::Process::new(pid)
+            .with_context(|| format!("No s'ha pogut obrir el procés PID {}", pid))?
+    } else {
+        let all_procs = procfs::process::all_processes()?;
+        all_procs
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|p| p.stat().map(|s| s.comm == target_name).unwrap_or(false))
+            .context("No s'ha trobat el procés")?
+    };
 
     let ifunc_optimizations = [
         // mem/str IFUNC de glibc
@@ -354,6 +463,66 @@ fn main() -> Result<()> {
                     match expected_ram {
                         Some(expected) if expected == offset_ram => {
                             if args.verbose { println!("\x1b[0;32m[OK]\x1b[0m {} (0x{:x})", sym_name, pointer); }
+
+                            // Verificació de bytes de codi:
+                            // - Sempre per a funcions de la llista ALWAYS_CHECK_CODE
+                            // - Per a totes les PLT si --check-code és actiu
+                            // - Mai per a funcions de RUNTIME_PATCHED_LIBC (falsos positius de glibc TSX)
+                            let is_runtime_patched = RUNTIME_PATCHED_LIBC.contains(&sym_name);
+                            let should_check_bytes = !is_runtime_patched && (
+                                ALWAYS_CHECK_CODE.contains(&sym_name)
+                                || (args.check_code && is_plt_func)
+                            );
+
+                            if should_check_bytes {
+                                match verify_function_bytes(sym_name, pointer, &lib_path, pid, &handle, 64) {
+                                    Ok(true) => {
+                                        if args.verbose {
+                                            println!("\x1b[0;32m[CODE OK]\x1b[0m {} primers 64 bytes coincideixen amb disc", sym_name);
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        println!("\x1b[0;1;31m[!!! CODI PATCHAT !!!]\x1b[0m '{}' té bytes modificats en RAM!", sym_name);
+                                        println!("    Lib:  {}", lib_path);
+                                        println!("    Addr: 0x{:x}", pointer);
+                                        // Mostra un diff dels primers 64 bytes
+                                        let buf = fs::read(&lib_path)
+                                            .or_else(|_| fs::read(format!("/proc/{}/root{}", pid, &lib_path)));
+                                        if let Ok(ref elf_buf) = buf {
+                                            if let Ok(elf_disc) = Elf::parse(elf_buf) {
+                                                if let Some(sv) = elf_disc.dynsyms.iter().find_map(|s| {
+                                                    if elf_disc.dynstrtab.get_at(s.st_name) == Some(sym_name) && s.st_value != 0 { Some(s.st_value) } else { None }
+                                                }) {
+                                                    if let Some(fo) = elf_disc.program_headers.iter().find_map(|ph| {
+                                                        if ph.p_type == goblin::elf::program_header::PT_LOAD && ph.p_vaddr <= sv && sv < ph.p_vaddr + ph.p_filesz {
+                                                            Some((sv - ph.p_vaddr + ph.p_offset) as usize)
+                                                        } else { None }
+                                                    }) {
+                                                        if fo + 64 <= elf_buf.len() {
+                                                            let disc = &elf_buf[fo..fo+64];
+                                                            let mut ram = vec![0u8; 64];
+                                                            if handle.copy_address(pointer as usize, &mut ram).is_ok() {
+                                                                println!("    Disc: {}", disc.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
+                                                                println!("    RAM:  {}", ram.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
+                                                                // Marca les diferències
+                                                                let diff: String = disc.iter().zip(ram.iter())
+                                                                    .map(|(d, r)| if d == r { "   " } else { " ^^"})
+                                                                    .collect::<Vec<_>>().join("");
+                                                                println!("    Diff: {}", diff);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if args.verbose {
+                                            println!("\x1b[0;33m[WARN]\x1b[0m No s'han pogut verificar bytes de '{}': {}", sym_name, e);
+                                        }
+                                    }
+                                }
+                            }
                         },
                         Some(expected) => {
                             if is_ifunc {

@@ -27,6 +27,10 @@ RUN apt-get install -y --allow-downgrades --allow-unauthenticated \
     strings \
     systemd
 
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Creem el directori necessari per a SSH
 RUN mkdir -p /var/run/sshd
 
@@ -34,4 +38,4 @@ RUN mkdir -p /var/run/sshd
 RUN ssh-keygen -A
 
 # Indiquem que el contenidor s'iniciï amb l'init de systemd
-CMD ["/lib/systemd/systemd"]
+CMD ["/entrypoint.sh"]
